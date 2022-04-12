@@ -1,0 +1,245 @@
+---
+title: "BME 580 Project: Group 9"
+author: "Changxin Yu and Krista Peng"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(lattice)
+library(Rmisc)
+library(dplyr)
+library(ggplot2)
+library(factoextra)
+library(tree)
+library(randomForest)
+library(e1071) # SVM
+library(MASS)
+library(klaR)
+library(adabag) # boosting
+```
+
+```{r}
+library(readxl)
+oriData <- read_xlsx("E:\\things\\Duke University\\study\\2022 Spring\\BME 580\\HW\\Project group\\Assignment 4 - Final report\\ASA7-1A4 ALL DATA WITH QUANTIFY INFORMATION.xlsx")
+```
+
+
+```{r feature selection}
+oriData = oriData %>% dplyr::select(-c(Checked,`Biological Process`, 
+                                       `Cellular Component`, `Molecular Function`,
+                                       `Entrez Gene ID`, `KEGG Pathways`, 
+                                       `Reactome Pathways`))
+colnames(oriData)
+
+# Remove the rows that abundances are missing
+oriData = oriData[!is.na(oriData$`Abundances (Grouped): 4arm DMAP, Day 14`),]
+
+# Count number of CV
+CVValue = as.matrix(oriData[33:45])
+CVValue = as.vector(CVValue)
+CVabove30 = which(CVValue > 30)
+
+# Remove useless numeric columns
+oriData = oriData[,-c(5:19,29:45)]
+
+# Remove the rows that contaminant is true
+oriData = filter(oriData, oriData$Contaminant == FALSE)
+```
+EDA and pre-processing
+```{r outlier}
+# Histogram
+colnames(oriData)
+DValue = as.matrix(oriData[,c(5:7,11:13)])
+DValue = as.vector(DValue)
+DValue = as.data.frame(DValue)
+LValue = as.matrix(oriData[,c(8:10)])
+LValue = as.vector(LValue)
+LValue = as.data.frame(LValue)
+
+DHist = ggplot(DValue, aes(x=DValue))+theme_bw()+
+  geom_histogram(fill = "Light Blue",color = "Dark Blue",alpha = 0.5, 
+                 breaks=c(0,30,60,90,120,150,180,210,240,300,400,1200))+
+  labs(title = "Histogram of Abundances for DMAP",x="Abundance",y="Count")+
+  theme(plot.title = element_text(hjust = 0.5))
+LHist = ggplot(LValue, aes(x=LValue))+theme_bw()+
+  geom_histogram(fill = "Light Blue",color = "Dark Blue",alpha = 0.5,
+                 breaks=c(0,20,40,60,80,100,120,140,160,180,200,240,300,400,800))+
+  labs(title = "Histogram of Abundances for LMAP",x="Abundance",y="Count")+
+  theme(plot.title = element_text(hjust = 0.5))
+multiplot(DHist, LHist, cols=1)
+
+# length(DValue[DValue$DValue>300,])/length(DValue$DValue)
+# length(LValue[LValue$LValue>300,])/length(LValue$LValue)
+# length(DValue[DValue$DValue>mean(DValue$DValue)+3*sd(DValue$DValue),])
+
+# winsorize 99.5%
+DLValue = c(DValue$DValue,LValue$LValue)
+bound = quantile(DLValue,0.995)
+names(bound) = NULL
+oriData[5:13][oriData[5:13] > bound] = bound
+```
+```{r}
+# Build a new dataset that  follows the common form
+numerData = oriData
+numerData = numerData %>% dplyr::select(-c(`Protein FDR Confidence: Combined`,
+                                           Description, Contaminant, `Gene Symbol`))
+colnames(numerData)
+numerData = t(numerData)
+rownames(numerData) = NULL
+numerData = as.data.frame(numerData)
+numerData$outcome = c("D","D","D","L","L","L","D","D","D")
+centerData = numerData
+centerData[1:4887] = scale(centerData[1:4887], scale = F, center = T)
+row.names(centerData) = c("4D14","4D21","4D4","4L14","4L21","4L4","8D14","8D21","8D4")
+```
+
+```{r PCA}
+prout = prcomp(centerData[1:4887])
+summary(prout)
+get_eig(prout)
+
+fviz_pca_ind(prout,repel=T,geom=c("text","point"), habillage = centerData$outcome,
+             title = "PCA individuals plot", show.clust.cent = F)+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+fviz_pca_biplot(prout,repel=T,geom=c("text","point"), geom.var = c("arrow"),
+                title = "PCA biplot")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+fviz_pca_var(prout,repel=T,geom.var = c("point"),col.var="contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             title = "PCA variables plot")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+fviz_eig(prout,addlabels=T,title="Scree Plot of Explained Variance")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+```
+
+```{r Clusetering}
+# kmeans
+km = kmeans(centerData[1:4887],center = 2)
+fviz_cluster(km, centerData[1:4887], main = "K-means Clustering",
+             labelsize = 10, repel=T) + theme_bw() + 
+  theme(plot.title = element_text(hjust = 0.5, size = 14))
+
+# Hierarchical Clustering 
+dist1=dist(centerData[1:4887], method="manhattan")
+hcl1 = hclust(dist1, method="complete")
+plot(hcl1, main = "Dendrogram of Hierarchical Clustering")
+rect.hclust(hcl1,k=2,border="red")
+```
+
+```{r heat map}
+heatmap(as.matrix(centerData[1:4887]),Rowv = NA, Colv = NA)
+```
+
+Supervised learning
+```{r}
+pcaData = as.data.frame(prout$x[,1:6])
+pcaData$outcome = as.factor(c("D","D","D","L","L","L","D","D","D"))
+# remove data collected on day 4
+pcaData = pcaData[-c(3,6,9),]
+
+# tree model
+treeMod = tree(outcome~., data = pcaData)
+summary(treeMod)
+# only one leaf, could not be pruned
+rfMod = randomForest(outcome~., data = pcaData, mtry=2)
+table(Predicted=predict(rfMod,pcaData), Actual=pcaData$outcome)
+# tune number of trees and number of predictors
+which.min(rfMod$mse)
+tuner = tuneRF(pcaData[1:4], pcaData$outcome, stepFactor = .5, plot=T,
+               ntreeTry = 500, improve = 0.1) # mtry=2
+
+# LDA model
+ldaMod = lda(outcome~., data = pcaData)
+ldaMod
+ldaPred = predict(ldaMod,pcaData)
+table(Predicted=ldaPred$class, Actual=pcaData$outcome)
+ldahist(data=ldaPred$x[,1],g=pcaData$outcome)
+title("LDA histogram of DMAP and LMAP")
+
+# SVM model
+svmMod = svm(outcome~., data = pcaData, kernel="linear")
+svmPred = predict(svmMod,pcaData)
+table(Predicted=svmPred, Actual=pcaData$outcome)
+# svmTune<-tune.svm(outcome~., data = pcaData, gamma = 10^(-5:-1), cost = 10^(-1:2))
+# report an error when observations less than 10
+```
+
+
+```{r LOOCV}
+library(caret)
+folds = createFolds(pcaData$outcome,k=6)
+accu_vec = vector()
+# LDA
+for(i in 1:6){
+  fold_test = pcaData[folds[[i]],]
+  fold_train = pcaData[-folds[[i]],]
+  ldaMod = lda(outcome~., data = fold_train)
+  ldaPred = predict(ldaMod, fold_test)
+  conTab = table(Predicted=ldaPred$class, Actual=fold_test$outcome)
+  accu_fold = conTab[1,1]+conTab[2,2]
+  accu_vec[i] = accu_fold
+}
+print(mean(accu_vec))
+# random forest
+for(i in 1:6){
+  fold_test = pcaData[folds[[i]],]
+  fold_train = pcaData[-folds[[i]],]
+  rfMod = randomForest(outcome~., data = fold_train, mtry = 2)
+  conTab = table(Predicted=predict(rfMod, fold_test), Actual=fold_test$outcome)
+  accu_fold = conTab[1,1]+conTab[2,2]
+  accu_vec[i] = accu_fold
+}
+print(mean(accu_vec))
+# SVM
+for(i in 1:6){
+  fold_test = pcaData[folds[[i]],]
+  fold_train = pcaData[-folds[[i]],]
+  svmMod = svm(outcome~., data = fold_train, kernel="linear", cost=10)
+  conTab = table(Predicted=predict(svmMod, fold_test), Actual=fold_test$outcome)
+  accu_fold = conTab[1,1]+conTab[2,2]
+  accu_vec[i] = accu_fold
+}
+print(mean(accu_vec))
+```
+
+```{r variable contribution}
+for(i in 1:6){
+  a = sort(prout$rotation[,i], decreasing = T)
+  b = head(a,20)
+  print(sprintf("The top 20 loadings of PC%d", i))
+  print(b)
+  cat("\n")
+}
+
+p1 = fviz_contrib(prout, choice = "var", axes = 1, top = 20)+
+  labs(title = "Variable Contribution: the 1st PC")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=8))
+p2 = fviz_contrib(prout, choice = "var", axes = 2, top = 20)+
+  labs(title = "Variable Contribution: the 2nd PC")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=8))
+p3 = fviz_contrib(prout, choice = "var", axes = 3, top = 20)+
+  labs(title = "Variable Contribution: the 3rd PC")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=8))
+p4 = fviz_contrib(prout, choice = "var", axes = 4, top = 20)+
+  labs(title = "Variable Contribution: the 4th PC")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=8))
+p5 = fviz_contrib(prout, choice = "var", axes = 5, top = 20)+
+  labs(title = "Variable Contribution: the 5th PC")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=8))
+p6 = fviz_contrib(prout, choice = "var", axes = 6, top = 20)+
+  labs(title = "Variable Contribution: the 6th PC")+ 
+  theme(plot.title = element_text(hjust = 0.5, size = 10))+
+  theme(axis.text.x = element_text(angle=90, vjust=.5, hjust=1, size=8))
+multiplot(p1, p4, p2, p5, p3, p6, cols=3)
+```
+
+
